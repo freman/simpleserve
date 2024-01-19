@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
@@ -10,8 +9,6 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"flag"
-	"fmt"
-	"io"
 	"log"
 	"math/big"
 	"net"
@@ -23,6 +20,8 @@ func main() {
 	port := flag.String("p", "8100", "port to serve on")
 	verbose := flag.Bool("v", false, "verbose logging of requests")
 	directory := flag.String("d", ".", "the directory of static file to host")
+	creds := flag.String("c", "", "credentials in the form of user:pass")
+
 	flag.Parse()
 
 	cacrt := &x509.Certificate{
@@ -98,7 +97,7 @@ func main() {
 		panic(err)
 	}
 
-	http.Handle("/", logging(*verbose, http.FileServer(http.Dir(*directory))))
+	http.Handle("/", logging(*verbose, basicAuth(http.FileServer(http.Dir(*directory)), *creds)))
 
 	listener, err := net.Listen("tcp", ":"+*port)
 	if err != nil {
@@ -111,60 +110,6 @@ func main() {
 		Certificates: []tls.Certificate{finaltls},
 	}}, nil); err != nil {
 		panic(err)
-	}
-}
-
-func logging(enabled bool, next http.Handler) http.Handler {
-	if !enabled {
-		return next
-	}
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-
-		crw := newCustomResponseWriter(w)
-		next.ServeHTTP(crw, r)
-
-		addr := r.RemoteAddr
-
-		log.Printf(`(%s) "%s %s %s" %d %d %s`, addr, r.Method, r.RequestURI, r.Proto, crw.status, crw.size, time.Since(start))
-	})
-}
-
-type customResponseWriter struct {
-	http.ResponseWriter
-	status int
-	size   int
-}
-
-func (c *customResponseWriter) WriteHeader(status int) {
-	c.status = status
-	c.ResponseWriter.WriteHeader(status)
-}
-
-func (c *customResponseWriter) Write(b []byte) (int, error) {
-	size, err := c.ResponseWriter.Write(b)
-	c.size += size
-	return size, err
-}
-
-func (c *customResponseWriter) Flush() {
-	if f, ok := c.ResponseWriter.(http.Flusher); ok {
-		f.Flush()
-	}
-}
-
-func (c *customResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	if hj, ok := c.ResponseWriter.(http.Hijacker); ok {
-		return hj.Hijack()
-	}
-	return nil, nil, fmt.Errorf("ResponseWriter does not implement the Hijacker interface")
-}
-
-func newCustomResponseWriter(w http.ResponseWriter) *customResponseWriter {
-	// When WriteHeader is not called, it's safe to assume the status will be 200.
-	return &customResponseWriter{
-		ResponseWriter: w,
-		status:         200,
 	}
 }
 
@@ -188,63 +133,4 @@ func getIPs() (ips []net.IP) {
 		}
 	}
 	return ips
-}
-
-// SplitListener reads the first byte off the wire to figure out if it's a tls connection or http connection
-// Exporting purely so it can be recycled in the hybridconsul registry at a later date
-type SplitListener struct {
-	net.Listener
-	Config *tls.Config
-}
-
-// Accept implements the listener interface
-func (l SplitListener) Accept() (net.Conn, error) {
-	c, err := l.Listener.Accept()
-	if err != nil {
-		return nil, err
-	}
-
-	preamble := make([]byte, 1)
-	_, err = c.Read(preamble)
-	if err != nil {
-		c.Close()
-		if err != io.EOF {
-			return nil, err
-		}
-	}
-
-	cc := &conn{
-		Conn:     c,
-		preamble: preamble,
-		err:      err,
-	}
-
-	if preamble[0] == 22 {
-		// HTTPS
-		return tls.Server(cc, l.Config), nil
-	}
-	// HTTP
-	return cc, nil
-}
-
-type conn struct {
-	net.Conn
-	preamble []byte
-	err      error
-}
-
-func (c *conn) Read(b []byte) (int, error) {
-	if c.preamble != nil {
-		b[0] = c.preamble[0]
-		c.preamble = nil
-		if len(b) > 1 && c.err == nil {
-			n, err := c.Conn.Read(b[1:])
-			if err != nil {
-				c.Conn.Close()
-			}
-			return n + 1, err
-		}
-		return 1, c.err
-	}
-	return c.Conn.Read(b)
 }
